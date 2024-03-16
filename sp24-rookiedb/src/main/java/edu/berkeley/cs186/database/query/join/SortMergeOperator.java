@@ -139,9 +139,76 @@ public class SortMergeOperator extends JoinOperator {
          * or null if there are no more records to join.
          */
         private Record fetchNextRecord() {
-            // TODO(proj3_part1): implement
+            // DONE(proj3_part1): implement
+            while (leftRecord != null) {
+                if (!marked) { // no marked before
+                    if (compare(leftRecord, rightRecord) < 0) {
+                        // if ri < sj, advance R
+                        if (leftIterator.hasNext()) {
+                            leftRecord = leftIterator.next();
+                        } else {
+                            // no more to join
+                            return null;
+                        }
+
+                    } else if (compare(leftRecord, rightRecord) > 0) {
+                        // if ri > sj, advance S
+                        if (rightIterator.hasNext()) {
+                            rightRecord = rightIterator.next();
+                        } else {
+                            // no more to join
+                            return null;
+                        }
+                    } else {
+                        // if matched, mark the current S spot, return, advance S.
+                        rightIterator.markPrev();
+                        marked = true;
+                        Record nextRecord = leftRecord.concat(rightRecord);
+                        if (!rightIterator.hasNext()) {
+                            // directly advance R, reset S, cancel the mark
+                            marked = false;
+                            if (leftIterator.hasNext()) {
+                                leftRecord = leftIterator.next();
+                            } else {
+                                leftRecord = null;
+                            }
+                            rightIterator.reset();
+                        }
+                        rightRecord = rightIterator.next();
+                        return nextRecord;
+                    }
+                } else { // have marked
+                    if (compare(leftRecord, rightRecord) == 0) {
+                        Record nextRecord = leftRecord.concat(rightRecord);
+                        if (!rightIterator.hasNext()) {
+                            // directly advance R, reset S, cancel the mark
+                            marked = false;
+                            if (leftIterator.hasNext()) {
+                                leftRecord = leftIterator.next();
+                            } else {
+                                leftRecord = null;
+                            }
+                            rightIterator.reset();
+                        }
+                        // return and advance S
+                        rightRecord = rightIterator.next();
+                        return nextRecord;
+                    } else {
+                        // if not match, advance R, reset S, cancel the mark
+                        marked = false;
+                        if (leftIterator.hasNext()) {
+                            leftRecord = leftIterator.next();
+                        } else {
+                            // no more to join
+                            return null;
+                        }
+                            rightIterator.reset();
+                            rightRecord = rightIterator.next();
+                        }
+                    }
+                }
             return null;
-        }
+            }
 
         @Override
         public void remove() {

@@ -87,7 +87,15 @@ public class BNLJOperator extends JoinOperator {
          * Make sure you pass in the correct schema to this method.
          */
         private void fetchNextLeftBlock() {
-            // TODO(proj3_part1): implement
+            // DONE(proj3_part1): implement
+            // The left source is empty, do nothing.
+            if (!leftSourceIterator.hasNext()) return;
+            // create the leftBlock Iterator based on the remain records in leftSourceIterator.
+            leftBlockIterator = getBlockIterator(leftSourceIterator, getLeftSource().getSchema(), numBuffers - 2);
+            // leftBlockIterator should be set to a backtracking iterator, so we mark the first record.
+            leftBlockIterator.markNext();
+            // leftRecord should be set to the first record in this block
+            leftRecord = leftBlockIterator.next();
         }
 
         /**
@@ -102,7 +110,13 @@ public class BNLJOperator extends JoinOperator {
          * Make sure you pass in the correct schema to this method.
          */
         private void fetchNextRightPage() {
-            // TODO(proj3_part1): implement
+            // DONE(proj3_part1): implement
+            // The right source is empty, do nothing.
+            if (!rightSourceIterator.hasNext()) return;
+            // create the rightPage Iterator based on the remain records in rightSourceIterator. use getBlockIterrator method and set maxPages = 1 to get pageIterator.
+            rightPageIterator = getBlockIterator(rightSourceIterator, getRightSource().getSchema(),1);
+            // rightPageIterator should be set to a backtracking iterator, so we mark the first record.
+            rightPageIterator.markNext();
         }
 
         /**
@@ -114,8 +128,42 @@ public class BNLJOperator extends JoinOperator {
          * of JoinOperator).
          */
         private Record fetchNextRecord() {
-            // TODO(proj3_part1): implement
-            return null;
+            // DONE(proj3_part1): implement
+            // The left source was empty, nothing to fetch
+            if (leftRecord == null){
+                return null;
+            }
+            while (true) {
+                if (this.rightPageIterator.hasNext()) {
+                    // case 1
+                    // there's a next right record in current rightPage, join it if there's a match
+                    Record rightRecord = rightPageIterator.next();
+                    if (compare(leftRecord, rightRecord) == 0)  {
+                        return leftRecord.concat(rightRecord);
+                    }
+                } else if (leftBlockIterator.hasNext()) {
+                    // case 2
+                    // there's no more right records but there's still left
+                    // records. Advance left and reset right
+                    this.leftRecord = leftBlockIterator.next();
+                    this.rightPageIterator.reset();
+                } else if (rightSourceIterator.hasNext()) {
+                    // case 3
+                    // both reach to end, and still rightPages left, reset left and advance right
+                    leftBlockIterator.reset();
+                    leftRecord = leftBlockIterator.next();
+                    fetchNextRightPage();
+                } else if (leftSourceIterator.hasNext()) {
+                    // case 4
+                    // both reach to end, run out of right, but left block left, advance left, reset all rightSource and get rightPage
+                    fetchNextLeftBlock();
+                    rightSourceIterator.reset();
+                    fetchNextRightPage();
+                } else {
+                    // all run out
+                    return null;
+                }
+            }
         }
 
         /**

@@ -86,14 +86,21 @@ public class SortOperator extends QueryOperator {
      * iterator
      */
     public Run sortRun(Iterator<Record> records) {
-        // TODO(proj3_part1): implement
-        return null;
+        // DONE(proj3_part1): implement
+        List<Record> sortedRecord = new ArrayList<>();
+        while (records.hasNext()) {
+            sortedRecord.add(records.next());
+        }
+        sortedRecord.sort(this.comparator);
+        Run sorted_run = new Run(transaction, this.getSchema());
+        sorted_run.addAll(sortedRecord);
+        return sorted_run;
     }
 
     /**
      * Given a list of sorted runs, returns a new run that is the result of
      * merging the input runs. You should use a Priority Queue (java.util.PriorityQueue)
-     * to determine which record should be should be added to the output run
+     * to determine which record should be added to the output run
      * next.
      *
      * You are NOT allowed to have more than runs.size() records in your
@@ -107,8 +114,39 @@ public class SortOperator extends QueryOperator {
      */
     public Run mergeSortedRuns(List<Run> runs) {
         assert (runs.size() <= this.numBuffers - 1);
-        // TODO(proj3_part1): implement
-        return null;
+        // DONE(proj3_part1): implement
+        // the return Run
+        Run newSortedRun = new Run(transaction, this.getSchema());
+
+        // contains all the run iterator in runs lst.
+        List<BacktrackingIterator<Record>> runs_iterator_lst = new ArrayList<>();
+        for (Run run : runs) {
+            runs_iterator_lst.add(run.iterator());
+        }
+
+        PriorityQueue<Pair<Record, Integer>>  pq = new PriorityQueue<>(new RecordPairComparator());
+        // initialize the pq with all the smallest record in each Run
+        for (int i = 0; i < runs_iterator_lst.size(); i++) {
+            BacktrackingIterator<Record> run_iterator = runs_iterator_lst.get(i);
+            if (run_iterator.hasNext()) {
+                Pair<Record, Integer> new_pair = new Pair<>(run_iterator.next(), i);
+                pq.add(new_pair);
+            }
+        }
+         // each time we drop the smallest one, add new record in the same runs if it has next.
+        while (!pq.isEmpty()) {
+            Pair<Record, Integer> smallest_pair = pq.poll();
+            Record smallest_record = smallest_pair.getFirst();
+            Integer run_index = smallest_pair.getSecond();
+            newSortedRun.add(smallest_record);
+            BacktrackingIterator<Record> run_iterator = runs_iterator_lst.get(run_index);
+            if (run_iterator.hasNext()) {
+                Pair<Record, Integer> new_pair = new Pair<>(run_iterator.next(), run_index);
+                pq.add(new_pair);
+            }
+        }
+
+        return newSortedRun;
     }
 
     /**
@@ -132,8 +170,21 @@ public class SortOperator extends QueryOperator {
      * @return a list of sorted runs obtained by merging the input runs
      */
     public List<Run> mergePass(List<Run> runs) {
-        // TODO(proj3_part1): implement
-        return Collections.emptyList();
+        // DONE(proj3_part1): implement
+        // the return runs
+        List<Run> new_runs = new ArrayList<>();
+        int N = runs.size();
+        int merge_pages = numBuffers - 1;
+        int start = 0, end = Integer.min(merge_pages, N);
+        // each time we choose B-1 runs, merge them.
+        while (start < N) {
+            List<Run> current_pass_runs = runs.subList(start, end);
+            Run new_run = mergeSortedRuns(current_pass_runs);
+            new_runs.add(new_run);
+            start = end;
+            end = Integer.min(end+merge_pages, N);
+        }
+        return new_runs;
     }
 
     /**
@@ -148,8 +199,19 @@ public class SortOperator extends QueryOperator {
         // Iterator over the records of the relation we want to sort
         Iterator<Record> sourceIterator = getSource().iterator();
 
-        // TODO(proj3_part1): implement
-        return makeRun(); // TODO(proj3_part1): replace this!
+        // DONE(proj3_part1): implement
+        // pass0, each time we pass in B pages record, and use sortRun to get a sorted run.
+        List<Run> sortedRuns = new ArrayList<>();
+        while (sourceIterator.hasNext()) {
+            sortedRuns.add(sortRun(getBlockIterator(sourceIterator, this.getSchema(), numBuffers)));
+        }
+
+        // pass1->n recursively call mergePass until the newRunsLst is single.
+        while (sortedRuns.size() > 1) {
+            sortedRuns = mergePass(sortedRuns);
+        }
+
+        return sortedRuns.get(0);
     }
 
     /**
