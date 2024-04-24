@@ -81,6 +81,35 @@ public class ARIESRecoveryManager implements RecoveryManager {
         this.transactionTable.put(transaction.getTransNum(), new TransactionTableEntry(transaction));
     }
 
+
+    // Some help function for commit abort and end.
+
+    /**
+     * Use for create new record for commit, abort and end.
+     *
+     * @param transNum transaction being running.
+     * @param type need record type
+     * @return the new needed record
+     */
+    public LogRecord createRecord(long transNum, String type) {
+        TransactionTableEntry transactionTableEntry = transactionTable.get(transNum);
+
+        // use Transaction Table to get the lastLSN which is also the prevLSN that stores the last operation from the same transaction.
+        long prevLSN = transactionTableEntry.lastLSN;
+
+        // create the new needed record
+        switch (type) {
+            case "commit":
+                return new CommitTransactionLogRecord(transNum, prevLSN);
+            case "abort":
+                return new AbortTransactionLogRecord(transNum, prevLSN);
+            case "end":
+                return new EndTransactionLogRecord(transNum, prevLSN);
+            default:
+                return null;
+        }
+    }
+
     /**
      * Called when a transaction is about to start committing.
      *
@@ -92,8 +121,26 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long commit(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry transactionTableEntry = transactionTable.get(transNum);
+
+        // append commit record
+        // create the new commit record. (this record's LSN is handled in LongManager#appendToLog)
+        LogRecord commitTransactionLogRecord = createRecord(transNum, "commit");
+
+        // append the record to the log and get its LSN
+        long recordLSN = logManager.appendToLog(commitTransactionLogRecord);
+
+        // In commit the commit record needs to be flushed to disk before the commit call returns to ensure durability.
+        // flush the log into disk
+        flushToLSN(recordLSN);
+
+        // update the transaction status
+        transactionTableEntry.transaction.setStatus(Transaction.Status.COMMITTING);
+        // update its LastLSN.
+        transactionTableEntry.lastLSN = recordLSN;
+
+        // return the LSN of the commit record
+        return recordLSN;
     }
 
     /**
@@ -108,8 +155,22 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long abort(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry transactionTableEntry = transactionTable.get(transNum);
+
+        // append abort record
+        // create the new abort record. (this record's LSN is handled in LongManager#appendToLog)
+        LogRecord abortTransactionLogRecord = createRecord(transNum, "abort");
+
+        // append the record to the log and get its LSN
+        long recordLSN = logManager.appendToLog(abortTransactionLogRecord);
+
+        // update the transaction status
+        transactionTableEntry.transaction.setStatus(Transaction.Status.ABORTING);
+        // update its LastLSN.
+        transactionTableEntry.lastLSN = recordLSN;
+
+        // return the LSN of the abort record
+        return recordLSN;
     }
 
     /**
@@ -126,8 +187,26 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long end(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        TransactionTableEntry transactionTableEntry = transactionTable.get(transNum);
+
+        // if the transaction is aborting, should roll back changes using rollbackToLSN helper function.
+        if (transactionTableEntry.transaction.getStatus().equals(Transaction.Status.ABORTING)) {
+            rollbackToLSN(transNum, 0);
+        }
+
+        // append end record
+        // create the new end record. (this record's LSN is handled in LongManager#appendToLog)
+        LogRecord abortTransactionLogRecord = createRecord(transNum, "end");
+        // append the record to the log and get its LSN
+        long recordLSN = logManager.appendToLog(abortTransactionLogRecord);
+
+        // remove this transaction from Transaction Table
+        transactionTable.remove(transNum);
+        // update the transaction status
+        transactionTableEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+
+        // return the LSN of the end record
+        return recordLSN;
     }
 
     /**
@@ -154,7 +233,22 @@ public class ARIESRecoveryManager implements RecoveryManager {
         // Small optimization: if the last record is a CLR we can start rolling
         // back from the next record that hasn't yet been undone.
         long currentLSN = lastRecord.getUndoNextLSN().orElse(lastRecordLSN);
-        // TODO(proj5) implement the rollback logic described above
+
+        //The undo phase will start at the end of the log and works its way towards the start of the log.
+        while (currentLSN > LSN) {
+            LogRecord currRecord = logManager.fetchLogRecord(currentLSN);
+            // undoes every UPDATE Logs (only UPDATEs!), use isUndoable to check.
+            if (currRecord.isUndoable()) {
+                // Get a compensation log record (CLR) by calling undo on the record
+                LogRecord CLR = currRecord.undo(transactionEntry.lastLSN);
+                // Append the CLR and update transaction LastLSN.
+                transactionEntry.lastLSN = logManager.appendToLog(CLR);
+                // Call redo on the CLR to perform the undo
+                CLR.redo(this, diskSpaceManager, bufferManager);
+            }
+            // update the current LSN to that of the next record to undo(Which is the prevLSN)
+            currentLSN = currRecord.getPrevLSN().orElse(-1L);
+        }
     }
 
     /**
@@ -204,8 +298,28 @@ public class ARIESRecoveryManager implements RecoveryManager {
                              byte[] after) {
         assert (before.length == after.length);
         assert (before.length <= BufferManager.EFFECTIVE_PAGE_SIZE / 2);
-        // TODO(proj5): implement
-        return -1L;
+
+        TransactionTableEntry transactionTableEntry = transactionTable.get(transNum);
+
+        // append update record
+        // use Transaction Table to get the lastLSN which is also the prevLSN that stores the last operation from the same transaction.
+        long prevLSN = transactionTableEntry.lastLSN;
+        // create the new UPDATE record. (this record's LSN is handled in LongManager#appendToLog)
+        LogRecord updatePageLogRecord = new UpdatePageLogRecord(transNum, pageNum, prevLSN, pageOffset, before, after);
+        // append the record to the log and get its LSN
+        long recordLSN = logManager.appendToLog(updatePageLogRecord);
+
+        // Update Transaction Table by updating the lastLSN
+        transactionTableEntry.lastLSN = recordLSN;
+
+        // Update DPT
+        // if this pageNum is not in DPT, add it.
+        if (!dirtyPageTable.containsKey(pageNum)) {
+            dirtyPageTable.put(pageNum, recordLSN);
+        }
+
+        // return the LSN of the update record
+        return recordLSN;
     }
 
     /**
@@ -380,8 +494,8 @@ public class ARIESRecoveryManager implements RecoveryManager {
         // All of the transaction's changes strictly after the record at LSN should be undone.
         long savepointLSN = transactionEntry.getSavepoint(name);
 
-        // TODO(proj5): implement
-        return;
+        // By just simply using #rollbackToLSN....
+        rollbackToLSN(transNum, savepointLSN);
     }
 
     /**
@@ -400,19 +514,55 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public synchronized void checkpoint() {
-        // Create begin checkpoint log record and write to log
+        // First, create begin checkpoint log record and write to log
         LogRecord beginRecord = new BeginCheckpointLogRecord();
         long beginLSN = logManager.appendToLog(beginRecord);
 
         Map<Long, Long> chkptDPT = new HashMap<>();
         Map<Long, Pair<Transaction.Status, Long>> chkptTxnTable = new HashMap<>();
 
-        // TODO(proj5): generate end checkpoint record(s) for DPT and transaction table
+        // DONE(proj5): generate end checkpoint record(s) for DPT and transaction table
+        // iterate through the dirtyPageTable and copy the entries.
+        int numDPTRecords = 0, numTxnTableRecords = 0;
+        for (Long pageNum : dirtyPageTable.keySet()) {
+            //  If at any point, copying the current record would cause the end checkpoint record to be too large,
+            //  an end checkpoint record with the copied DPT entries should be appended to the log.
+            if (!EndCheckpointLogRecord.fitsInOneRecord(numDPTRecords + 1, numTxnTableRecords)) {
+                LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(endRecord);
+                // initial all.
+                chkptDPT = new HashMap<>();
+                numDPTRecords = 0;
+            }
+            // else copy this entries to chkptDPT
+            chkptDPT.put(pageNum, dirtyPageTable.get(pageNum));
+            numDPTRecords++;
+        }
 
-        // Last end checkpoint record
+        // iterate through the transaction table, and copy the status/lastLSN, outputting end checkpoint records only as needed.
+        for (Long transNum : transactionTable.keySet()) {
+            //  If at any point, copying the current record would cause the end checkpoint record to be too large,
+            //  an end checkpoint record with the copied DPT entries should be appended to the log.
+            if (!EndCheckpointLogRecord.fitsInOneRecord(numDPTRecords, numTxnTableRecords + 1)) {
+                LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(endRecord);
+                // initial all.
+                chkptDPT = new HashMap<>();
+                chkptTxnTable = new HashMap<>();
+                numDPTRecords = 0;
+                numTxnTableRecords = 0;
+            }
+            // else copy the status/lastLSN to chkptTxnTable
+            TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+            Pair<Transaction.Status, Long> value = new Pair<>(transactionEntry.transaction.getStatus(), transactionEntry.lastLSN);
+            chkptTxnTable.put(transNum, value);
+            numTxnTableRecords++;
+        }
+
+        // Last end checkpoint record when nothing is left to be written
         LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
         logManager.appendToLog(endRecord);
-        // Ensure checkpoint is fully flushed before updating the master record
+        // Ensure checkpoint is fully flushed into disk before updating the master record
         flushToLSN(endRecord.getLSN());
 
         // Update master record
@@ -468,6 +618,181 @@ public class ARIESRecoveryManager implements RecoveryManager {
         this.checkpoint();
     }
 
+    // some help function for #restartAnanlysis /////////////////////////////
+
+    /**
+     * The following applies to record
+     * with a non-empty result for LogRecord#getTransNum().
+     * These are the records that involve a transaction,
+     * and therefore, we need to update the transaction table
+     * whenever we encounter one of these records.
+     */
+    public void logRecordsForTransactionOperations(LogRecord record) {
+        long transNum = record.getTransNum().get();
+        // If the transaction is not in the transaction table
+        if (!transactionTable.containsKey(transNum)) {
+            // use newTransaction function object to create a Transaction object
+            Transaction transaction = newTransaction.apply(transNum);
+            // use startTransaction to add it to txnTable.
+            startTransaction(transaction);
+        }
+        // update this transaction lastLSN
+        transactionTable.get(transNum).lastLSN = record.LSN;
+    }
+
+    /**
+     * The following applies to record
+     * with a non-empty result for LogRecord#getPageNum().
+     * These are the records that involve to Page,
+     * and therefore, we need to update the DPT.
+     */
+    public void logRecordsForPageOperations(LogRecord record) {
+        long pageID = record.getPageNum().get();
+        LogType type = record.getType();
+        // case this record is UpdatePage/UndoUpdatePage
+        if (type.equals(LogType.UPDATE_PAGE) || type.equals(LogType.UNDO_UPDATE_PAGE)) {
+            // if this page is already in DPT, do nothing,
+            // else add it with recLSN
+            if (!dirtyPageTable.containsKey(pageID)) {
+                dirtyPageTable.put(pageID, record.LSN);
+            }
+        }
+        // case this record is FreePage/UndoAllocPage.
+        else if (type.equals(LogType.FREE_PAGE) || type.equals(LogType.UNDO_ALLOC_PAGE)){
+            // remove from DPT
+            dirtyPageTable.remove(pageID);
+        }
+        // do anything for AllocPage/UndoFreePage>
+    }
+
+    /**
+     * The following applies to CommitTransaction/AbortTransaction/EndTransaction record
+     */
+    public void logRecordsForTransactionStatusChanges(LogRecord record, Set<Long> endedTransactions) {
+        long transNum = record.getTransNum().get();
+        LogType type = record.getType();
+        if (type.equals(LogType.COMMIT_TRANSACTION)) {
+            // if is CommitTransaction, set status to COMMITTING and update lastLSN
+            transactionTable.get(transNum).transaction.setStatus(Transaction.Status.COMMITTING);
+            transactionTable.get(transNum).lastLSN = record.LSN;
+        } else if (type.equals(LogType.ABORT_TRANSACTION)) {
+            // if is AbortTransaction, set status to RECOVERY_ABORTING and update lastLSN
+            transactionTable.get(transNum).transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+            transactionTable.get(transNum).lastLSN = record.LSN;
+        } else {
+            // if is EndTransaction, the transaction should be cleaned up before setting the status
+            // and the entry should be removed from the transaction table.
+            // also should add the ended transaction's transaction number into the endedTransactions set
+            transactionTable.get(transNum).transaction.cleanup();
+            transactionTable.get(transNum).transaction.setStatus(Transaction.Status.COMPLETE);
+            transactionTable.remove(transNum);
+            endedTransactions.add(transNum);
+        }
+    }
+
+    /**
+     * Return True if the status in the checkpoint is more "advanced" than the status in memory.
+     * Transactions will always advance through states in one of two ways:
+     * running -> committing -> complete
+     * running -> aborting -> complete
+     */
+    public boolean isAdvancedStatus(Transaction.Status chkptStatus, Transaction.Status memoryStatus) {
+        switch (memoryStatus) {
+            case RUNNING:
+                return chkptStatus.equals(Transaction.Status.COMMITTING)
+                        || chkptStatus.equals(Transaction.Status.COMPLETE)
+                        || chkptStatus.equals(Transaction.Status.ABORTING);
+            case COMMITTING:
+            case ABORTING:
+                return chkptStatus.equals(Transaction.Status.COMPLETE);
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * The following applies to end checkpoint records.
+     * The tables stored in the record should be combined with the tables currently in memory
+     */
+    public void logRecordsForEndCheckpointRecords(LogRecord record, Set<Long> endedTransactions) {
+        // get chkptDPT and chkptTxnTable
+        Map<Long, Long> chkptDPT = record.getDirtyPageTable();
+        Map<Long, Pair<Transaction.Status, Long>> chkptTxnTable = record.getTransactionTable();
+
+        // copy all entries of checkpoint DPT (replace existing entries if any)
+        for (Long pageID : chkptDPT.keySet()) {
+            long recLSN = chkptDPT.get(pageID);
+            dirtyPageTable.put(pageID, recLSN);
+        }
+
+        // loop all entries of checkpoint txnTable
+        for (Long transNum : chkptTxnTable.keySet()) {
+            Transaction.Status chkptStatus = chkptTxnTable.get(transNum).getFirst();
+            long lastLSN = chkptTxnTable.get(transNum).getSecond();
+            // if this transaction is already in endedTransactions, skip
+            if (endedTransactions.contains(transNum)) continue;
+
+            // if this transaction not in txnTable, add it
+            if (!transactionTable.containsKey(transNum)) {
+                // use newTransaction function object to create a Transaction object
+                Transaction transaction = newTransaction.apply(transNum);
+                // use startTransaction to add it to txnTable.
+                startTransaction(transaction);
+            }
+
+            // The lastLSN of a transaction is the max one between two table
+            transactionTable.get(transNum).lastLSN = Math.max(lastLSN, transactionTable.get(transNum).lastLSN);
+
+            // The status's in the transaction table should be updated if it is possible
+            // to the status in the checkpoint.
+            Transaction.Status memoryStatus = transactionTable.get(transNum).transaction.getStatus();
+            if (isAdvancedStatus(chkptStatus, memoryStatus)) {
+                // Make sure that set to recovery aborting instead of aborting if the checkpoint says aborting
+                if (chkptStatus.equals(Transaction.Status.ABORTING)) {
+                    transactionTable.get(transNum).transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                } else{
+                    transactionTable.get(transNum).transaction.setStatus(chkptStatus);
+                }
+            }
+        }
+    }
+
+
+    /**
+     * After all records in the log are processed, for each ttable entry:
+     *      - if COMMITTING: clean up the transaction, change status to COMPLETE,
+     *        remove from the ttable, and append an end record
+     *      - if RUNNING: change status to RECOVERY_ABORTING, and append an abort
+     *        record
+     *      - if RECOVERY_ABORTING: no action needed
+     */
+    public void finalEndingTransactionsForRestartAnalysis() {
+        for (Long transNum : transactionTable.keySet()) {
+            Transaction transaction = transactionTable.get(transNum).transaction;
+            Transaction.Status status = transaction.getStatus();
+
+            // All transactions in the COMMITTING state should be ended (cleanup(),
+            // state set to COMPLETE, end transaction record written,
+            // and removed from the transaction table).
+            if (status.equals(Transaction.Status.COMMITTING)) {
+                transaction.cleanup();
+                transaction.setStatus(Transaction.Status.COMPLETE);
+                LogRecord endTransactionLogRecord = createRecord(transNum, "end");
+                logManager.appendToLog(endTransactionLogRecord);
+                transactionTable.remove(transNum);
+            }
+            // All transactions in the RUNNING state should be moved into the RECOVERY_ABORTING state,
+            // and an abort transaction record should be written.
+            else if (status.equals(Transaction.Status.RUNNING)) {
+                transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                LogRecord abortTransactionLogRecord = createRecord(transNum, "abort");
+                transactionTable.get(transNum).lastLSN = logManager.appendToLog(abortTransactionLogRecord);
+            }
+            // Nothing needs to be done for transactions in the RECOVERY_ABORTING state.
+        }
+    }
+
+
     /**
      * This method performs the analysis pass of restart recovery.
      *
@@ -519,8 +844,96 @@ public class ARIESRecoveryManager implements RecoveryManager {
         long LSN = masterRecord.lastCheckpointLSN;
         // Set of transactions that have completed
         Set<Long> endedTransactions = new HashSet<>();
-        // TODO(proj5): implement
-        return;
+
+        // DONE(proj5): implement
+        // begin scanning log records,
+        // starting at the beginning of the last successful checkpoint.
+        Iterator<LogRecord> logRecordIterator = logManager.scanFrom(LSN);
+        while (logRecordIterator.hasNext()) {
+            LogRecord currRecord = logRecordIterator.next();
+            LogType type = currRecord.getType();
+
+            // If the log record is for a transaction operation (getTransNum is present)
+            if (currRecord.getTransNum().isPresent()) {
+                logRecordsForTransactionOperations(currRecord);
+            }
+
+            // If the log record is page-related (getPageNum is present)
+            if (currRecord.getPageNum().isPresent()) {
+                logRecordsForPageOperations(currRecord);
+            }
+
+            // If the log record is for a change in transaction status
+            // CommitTransaction/AbortTransaction/EndTransaction
+            if (type.equals(LogType.COMMIT_TRANSACTION)
+                    || type.equals(LogType.ABORT_TRANSACTION)
+                    || type.equals(LogType.END_TRANSACTION)) {
+                logRecordsForTransactionStatusChanges(currRecord, endedTransactions);
+            }
+
+            // skip BeginCheckpoint record
+
+            // If the log record is an end_checkpoint record:
+            if (type.equals(LogType.END_CHECKPOINT)) {
+                logRecordsForEndCheckpointRecords(currRecord, endedTransactions);
+            }
+        }
+
+        // After all records in the log are processed, we need ending the Transactions
+        finalEndingTransactionsForRestartAnalysis();
+    }
+
+
+    // some help function for restartRedo /////////////////////////////////////
+
+    /**
+     * Return ture if this record is redoable and is either:
+     *  - a partition-related record (AllocPart, UndoAllocPart, FreePart, UndoFreePart)
+     *  - a record that allocates a page (AllocPage, UndoFreePage)
+     *  - a record that modifies a page (UpdatePage, UndoUpdatePage, UndoAllocPage, FreePage)
+     *    where all of the following hold:
+     *      - the page is in the DPT
+     *      - the record's LSN is greater than or equal to the DPT's recLSN for that page.
+     *      - the pageLSN on the page itself is strictly less than the LSN of the record.
+     */
+    public boolean isRedoRecord(LogRecord record) {
+        LogType type = record.getType();
+        if (record.isRedoable()) {
+            // a partition-related record
+            if (type.equals(LogType.ALLOC_PART)
+                    || type.equals(LogType.UNDO_ALLOC_PART)
+                    || type.equals(LogType.FREE_PART)
+                    || type.equals(LogType.UNDO_FREE_PART)) {
+                return true;
+            }
+            // a record that allocates a page
+            if (type.equals(LogType.ALLOC_PAGE)
+                    || type.equals(LogType.UNDO_FREE_PAGE)) {
+                return true;
+            }
+            // a record that modifies a page
+            if (type.equals(LogType.UPDATE_PAGE)
+                    || type.equals(LogType.UNDO_UPDATE_PAGE)
+                    || type.equals(LogType.UNDO_ALLOC_PAGE)
+                    || type.equals(LogType.FREE_PAGE)) {
+                long pageID = record.getPageNum().get();
+                // the page should in DPT
+                if (!dirtyPageTable.containsKey(pageID)) return false;
+                // the record's LSN is greater than or equal to the DPT's recLSN for that page.
+                long recLSN = dirtyPageTable.get(pageID);
+                if (record.getLSN() < recLSN) return false;
+                // the pageLSN on the page itself is strictly less than the LSN of the record.
+                Page page = bufferManager.fetchPage(new DummyLockContext(), pageID);
+                long pageLSN;
+                try {
+                    pageLSN = page.getPageLSN();
+                } finally {
+                    page.unpin();
+                }
+                return pageLSN < record.getLSN();
+            }
+        }
+        return false;
     }
 
     /**
@@ -536,8 +949,18 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *   the pageLSN is checked, and the record is redone if needed.
      */
     void restartRedo() {
-        // TODO(proj5): implement
-        return;
+        // DONE(proj5): implement
+        // Start at the smallest recLSN in the DPT
+        long startLSN = dirtyPageTable.values().stream().min(Long::compareTo).orElse(0L);
+        // Scanning from the starting point
+        Iterator<LogRecord> logRecordIterator = logManager.scanFrom(startLSN);
+        while (logRecordIterator.hasNext()) {
+            LogRecord currRecord = logRecordIterator.next();
+            // redo a record if it needs to
+            if (isRedoRecord(currRecord)) {
+                currRecord.redo(this, diskSpaceManager, bufferManager);
+            }
+        }
     }
 
     /**
@@ -549,13 +972,54 @@ public class ARIESRecoveryManager implements RecoveryManager {
      * Then, always working on the largest LSN in the priority queue until we are done,
      * - if the record is undoable, undo it, and append the appropriate CLR
      * - replace the entry with a new one, using the undoNextLSN if available,
-     *   if the prevLSN otherwise.
+     *   or the prevLSN otherwise.
      * - if the new LSN is 0, clean up the transaction, set the status to complete,
      *   and remove from transaction table.
      */
     void restartUndo() {
-        // TODO(proj5): implement
-        return;
+        // DONE(proj5): implement
+        // Create a maxHeap to store the lastLSN for all the transactions in the RECOVERY_ABORTING state
+        PriorityQueue<Long> maxLSNHeap = new PriorityQueue<>((a,b) -> b.compareTo(a));
+        for (Long transNum : transactionTable.keySet()) {
+            TransactionTableEntry te =transactionTable.get(transNum);
+            if (te.transaction.getStatus().equals(Transaction.Status.RECOVERY_ABORTING)) {
+                maxLSNHeap.add(te.lastLSN);
+            }
+        }
+
+        while (!maxLSNHeap.isEmpty()) {
+            long LSN = maxLSNHeap.poll();
+            LogRecord currRecord = logManager.fetchLogRecord(LSN);
+            long transNum = currRecord.getTransNum().get();
+            Transaction transaction = transactionTable.get(transNum).transaction;
+            // if the record is undoable
+            if (currRecord.isUndoable()) {
+                // we write the CLR, update the lastLSN and undo it
+                long lastLSN = transactionTable.get(transNum).lastLSN;
+                LogRecord CLR = currRecord.undo(lastLSN);
+                transactionTable.get(transNum).lastLSN = logManager.appendToLog(CLR);
+                // Call redo on the CLR to perform the undo
+                CLR.redo(this, diskSpaceManager, bufferManager);
+            }
+
+            // new LSN to the maxHeap with the undoNextLSN of the record if it has one, or the prevLSN otherwise
+            long newLSN = currRecord.getUndoNextLSN().orElse(currRecord.getPrevLSN().orElse(0L));
+
+            // if the new LSN is 0, clean up the transaction, set the status to complete,
+            // write the END record for that transaction.
+            // and remove from transaction table.
+            if (newLSN == 0L) {
+                transaction.cleanup();
+                transaction.setStatus(Transaction.Status.COMPLETE);
+                LogRecord endTransactionLogRecord = createRecord(transNum, "end");
+                logManager.appendToLog(endTransactionLogRecord);
+                transactionTable.remove(transNum);
+            }
+            // else just add this newLSN
+            else {
+                maxLSNHeap.offer(newLSN);
+            }
+        }
     }
 
     /**
